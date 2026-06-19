@@ -30,22 +30,33 @@ GS_SHEET = None
 if HAS_GS_LIBS:
     try:
         if "gcp_service_account" in st.secrets:
-            # Sao chép cấu hình từ secrets ra một dict mới để chỉnh sửa
+            # Lấy thông tin cấu hình ra để xử lý
             gcp_info = dict(st.secrets["gcp_service_account"])
             
-            # Tự động sửa định dạng private_key: thay thế \n thực tế thành ký tự xuống dòng chuẩn
             if "private_key" in gcp_info:
-                gcp_info["private_key"] = gcp_info["private_key"].replace("\\n", "\n")
+                key = gcp_info["private_key"]
+                
+                # 1. Đổi chuỗi \n thành xuống dòng thật và xóa ký tự lỗi \r
+                key = key.replace("\\n", "\n").replace("\r", "")
+                
+                # 2. Bắt buộc tách dòng chuẩn cho phần đầu và đuôi của khóa bí mật
+                key = key.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
+                key = key.replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----\n")
+                
+                # 3. Dọn dẹp nếu lỡ tạo ra khoảng trắng/xuống dòng thừa
+                key = key.replace("\n\n", "\n")
+                
+                # Cập nhật lại key chuẩn vào dict
+                gcp_info["private_key"] = key
                 
             scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
             creds = Credentials.from_service_account_info(gcp_info, scopes=scope)
             client = gspread.authorize(creds)
             
-            spreadsheet_id = st.secrets.get("spreadsheet_id")
-            if spreadsheet_id:
-                GS_SHEET = client.open_by_key(spreadsheet_id)
-            else:
-                GS_SHEET = client.open_by_key("12vYA8p8T2GHu4DBPW4HqIi01uUmzvkBxZ4Y28UE-R9I")
+            # Mở file Google Sheet
+            spreadsheet_id = st.secrets.get("spreadsheet_id", "12vYA8p8T2GHu4DBPW4HqIi01uUmzvkBxZ4Y28UE-R9I")
+            GS_SHEET = client.open_by_key(spreadsheet_id)
+            
     except Exception as e:
         st.error(f"Lỗi kết nối Google Sheets: {e}")
         GS_SHEET = None
