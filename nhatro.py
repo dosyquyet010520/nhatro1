@@ -7,9 +7,11 @@ import pandas as pd
 import base64
 import re
 import urllib.parse
+import io
 
-# --- TÍCH HỢP THƯ VIỆN GOOGLE SHEETS ---
+# --- TÍCH HỢP THƯ VIỆN GOOGLE SHEETS & DRIVE ---
 HAS_GS_LIBS = False
+HAS_DRIVE_LIBS = False
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -17,7 +19,15 @@ try:
 except ImportError:
     pass
 
-# --- HÀM BẢO MẬT & CHỐNG HACK ĐƯỜNG DẪN (SAN|TIZE) ---
+try:
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
+    import requests
+    HAS_DRIVE_LIBS = True
+except ImportError:
+    pass
+
+# --- HÀM BẢO MẬT & CHỐNG HACK ĐƯỜNG DẪN (SANITIZE) ---
 def hash_password(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
@@ -25,41 +35,42 @@ def clean_filename(text):
     """Lọc bỏ toàn bộ ký tự lạ, chỉ giữ lại chữ, số và dấu gạch ngang để bảo mật file/sheet"""
     return re.sub(r'[^a-zA-Z0-9_-]', '', str(text))
 
-# --- KẾT NỐI VÀ KHỞI TẠO GOOGLE SHEETS ---
+# --- KẾT NỐI VÀ KHỞI TẠO GOOGLE SERVICES ---
 GS_SHEET = None
+GCP_CREDS = None
+
 if HAS_GS_LIBS:
     try:
         if "gcp_service_account" in st.secrets:
-            # Lấy thông tin cấu hình ra để xử lý
             gcp_info = dict(st.secrets["gcp_service_account"])
             
             if "private_key" in gcp_info:
                 key = gcp_info["private_key"]
-                
-                # 1. Đổi chuỗi \n thành xuống dòng thật và xóa ký tự lỗi \r
                 key = key.replace("\\n", "\n").replace("\r", "")
-                
-                # 2. Bắt buộc tách dòng chuẩn cho phần đầu và đuôi của khóa bí mật
                 key = key.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
                 key = key.replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----\n")
-                
-                # 3. Dọn dẹp nếu lỡ tạo ra khoảng trắng/xuống dòng thừa
                 key = key.replace("\n\n", "\n")
-                
-                # Cập nhật lại key chuẩn vào dict
                 gcp_info["private_key"] = key
                 
             scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-            creds = Credentials.from_service_account_info(gcp_info, scopes=scope)
-            client = gspread.authorize(creds)
+            GCP_CREDS = Credentials.from_service_account_info(gcp_info, scopes=scope)
+            client = gspread.authorize(GCP_CREDS)
             
-            # Mở file Google Sheet
             spreadsheet_id = st.secrets.get("spreadsheet_id", "12vYA8p8T2GHu4DBPW4HqIi01uUmzvkBxZ4Y28UE-R9I")
             GS_SHEET = client.open_by_key(spreadsheet_id)
             
     except Exception as e:
         st.error(f"Lỗi kết nối Google Sheets: {e}")
         GS_SHEET = None
+
+def get_drive_service():
+    """Khởi tạo Drive Service để làm việc với tệp tin hình ảnh đám mây"""
+    if HAS_DRIVE_LIBS and GCP_CREDS:
+        try:
+            return build('drive', 'v3', credentials=GCP_CREDS)
+        except:
+            return None
+    return None
 
 def get_or_create_worksheet(name, headers):
     if GS_SHEET is None:
@@ -204,33 +215,83 @@ def get_previous_month(current_month_str):
     except:
         return ""
 
+# --- CHỈNH SỬA TOÀN DIỆN: HÀM UPLOAD ẢNH ĐÁM MÂY LÊN GOOGLE DRIVE ---
 def save_uploaded_image(uploaded_file, username, month, room, type_img):
     if uploaded_file is None:
         return ""
+    
     clean_month = month.replace("/", "_")
     safe_user = clean_filename(username)
     safe_room = clean_filename(room)
-    
+    ext = os.path.splitext(uploaded_file.name)[1] or ".jpg"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name = f"{safe_room}_{type_img}_{timestamp}{ext}"
+
+    # Ưu tiên tải trực tiếp lên Google Drive nếu kết nối Cloud hoạt động
+    drive_service = get_drive_service()
+    if drive_service:
+        try:
+            file_metadata = {'name': file_name}
+            uploaded_file.seek(0)
+            media = MediaIoBaseUpload(io.BytesIO(uploaded_file.read()), mimetype=uploaded_file.type, resumable=True)
+            
+            # Khởi tạo lệnh lưu tệp tin
+            drive_file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            file_id = drive_file.get('id')
+            
+            # Kích hoạt quyền chia sẻ công khai cho bất kỳ ai có link (Bắt buộc để st.image đọc được từ xa)
+            drive_service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
+            return f"https://drive.google.com/uc?id={file_id}"
+        except Exception as e:
+            st.warning(f"⚠️ Trục trặc kết nối Google Drive ({e}). Chuyển hướng lưu dữ liệu cục bộ...")
+
+    # Cơ chế dự phòng lưu Offline khi không có Cloud hoặc lỗi Drive
     dir_path = f"img_{safe_user}/{clean_month}"
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
     
-    ext = os.path.splitext(uploaded_file.name)[1] or ".jpg"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"{safe_room}_{type_img}_{timestamp}{ext}"
     full_path = os.path.join(dir_path, file_name)
-    
+    uploaded_file.seek(0)
     with open(full_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
     return full_path
 
-def get_img_base64(path):
-    if path and os.path.exists(path):
+# --- FIX LỖI: HÀM HIỂN THỊ ẢNH AN TOÀN CHỐNG SẬP WEB ---
+def render_image_safely(path_or_url, caption):
+    if not path_or_url:
+        return
+    
+    # Nếu là URL từ Google Drive, hiển thị trực tiếp
+    if str(path_or_url).startswith("http"):
+        st.image(path_or_url, caption=caption, width=200)
+    # Nếu là đường dẫn cục bộ và file còn tồn tại
+    elif os.path.exists(path_or_url):
+        st.image(path_or_url, caption=caption, width=200)
+    # File cục bộ đã bị server Cloud xóa tự động
+    else:
+        st.warning(f"⚠️ Dữ liệu hình ảnh cũ ({caption.lower()}) lưu trên bộ nhớ tạm cục bộ đã bị xóa tự động khi khởi động lại Server. Vui lòng tải lên ảnh minh chứng mới!")
+
+# --- CHỈNH SỬA: CHUYỂN ĐỔI CHUỖI LINK INTERNET HOẶC FILE THÀNH BASE64 ---
+def get_img_base64(path_or_url):
+    if not path_or_url:
+        return ""
+    
+    # Trường hợp ảnh lưu trên Google Drive
+    if str(path_or_url).startswith("http"):
         try:
-            with open(path, "rb") as f:
-                return base64.b64encode(f.read()).decode('utf-8')
+            resp = requests.get(path_or_url, timeout=10)
+            if resp.status_code == 200:
+                return base64.b64encode(resp.content).decode('utf-8')
         except:
             pass
+    # Trường hợp ảnh lưu cục bộ Local
+    else:
+        if os.path.exists(path_or_url):
+            try:
+                with open(path_or_url, "rb") as f:
+                    return base64.b64encode(f.read()).decode('utf-8')
+            except:
+                pass
     return ""
 
 # --- CẤU HÌNH GIAO DIỆN ---
@@ -807,7 +868,7 @@ else:
                         writer = csv.DictWriter(f, fieldnames=cust_fieldnames)
                         writer.writeheader()
                         cleaned_rows = [{k: v for k, v in c.items() if k in cust_fieldnames} for c in new_customers]
-                        writer.writerows(cleaned_rows)
+                        writer.writerows(cleaned_customers)
                         
                 log_action(st.session_state.username, "Cập nhật thành viên", f"Lưu danh sách người ở cùng phòng {selected_chu_ho['Phòng Ở']}")
                 st.success("💾 Đã lưu danh sách thành viên phòng thành công!")
@@ -864,7 +925,6 @@ else:
         # --- TỐI ƯU CHỌN THÁNG (BẰNG CÁCH CHỌN NĂM TRƯỚC) ---
         with col_ctrl1:
             current_year = datetime.now().year
-            # Tạo danh sách năm từ 2025 đến năm hiện tại + 3 năm nữa để dùng lâu dài
             year_list = list(range(2025, current_year + 4))
             
             sub_col_y, sub_col_m = st.columns(2)
@@ -978,6 +1038,7 @@ else:
             ten_phat_sinh = st.text_input("Tên phát sinh khác", value=val_ten_ps)
             tien_phat_sinh_val = st.number_input("Số tiền phát sinh khác", min_value=0, value=val_ps, step=10000)
 
+        # --- CHỈNH SỬA FIX LỖI: HIỂN THỊ ẢNH AN TOÀN TRONG FORM NHẬP ---
         st.markdown("#### 📸 Minh Chứng Chỉ Số (Hình Ảnh)")
         img_col1, img_col2 = st.columns(2)
         clean_thang = thang.replace("/", "_")
@@ -985,9 +1046,11 @@ else:
         
         with img_col1:
             if existing_invoice and existing_invoice.get("Ảnh Điện"):
-                st.image(existing_invoice["Ảnh Điện"], caption="Ảnh điện đang lưu", width=200)
+                render_image_safely(existing_invoice["Ảnh Điện"], "Ảnh điện đang lưu")
                 if st.button("🗑️ Xóa ảnh điện", key=f"del_img_elec_{dynamic_key_suffix}"):
-                    try: os.remove(existing_invoice["Ảnh Điện"])
+                    try:
+                        if not str(existing_invoice["Ảnh Điện"]).startswith("http"):
+                            os.remove(existing_invoice["Ảnh Điện"])
                     except: pass
                     all_rows[existing_invoice_idx]["Ảnh Điện"] = ""
                     
@@ -1005,9 +1068,11 @@ else:
 
         with img_col2:
             if existing_invoice and existing_invoice.get("Ảnh Nước"):
-                st.image(existing_invoice["Ảnh Nước"], caption="Ảnh nước đang lưu", width=200)
+                render_image_safely(existing_invoice["Ảnh Nước"], "Ảnh nước đang lưu")
                 if st.button("🗑️ Xóa ảnh nước", key=f"del_img_water_{dynamic_key_suffix}"):
-                    try: os.remove(existing_invoice["Ảnh Nước"])
+                    try:
+                        if not str(existing_invoice["Ảnh Nước"]).startswith("http"):
+                            os.remove(existing_invoice["Ảnh Nước"])
                     except: pass
                     all_rows[existing_invoice_idx]["Ảnh Nước"] = ""
                     
@@ -1072,7 +1137,6 @@ else:
         st.markdown("---")
         with st.expander("📊 3. THỐNG KÊ & XUẤT HÓA ĐƠN ĐÃ LƯU (BẤM ĐỂ MỞ TÌM KIẾM)", expanded=False):
             if all_rows:
-                # Tách lấy các năm và tháng ĐÃ TỪNG CÓ dữ liệu hóa đơn để làm bộ lọc thông minh
                 existing_years = sorted(list(set(r["Tháng"].split("/")[1] for r in all_rows if "/" in r["Tháng"])), reverse=True)
                 if not existing_years:
                     existing_years = [str(datetime.now().year)]
@@ -1082,7 +1146,6 @@ else:
                 with filter_col1:
                     thang_loc_nam = st.selectbox("Lọc theo Năm", existing_years, key="filter_year_main")
                 with filter_col2:
-                    # Lọc ra các tháng có dữ liệu của năm đã chọn
                     available_months = sorted(list(set(r["Tháng"].split("/")[0] for r in all_rows if "/" in r["Tháng"] and r["Tháng"].split("/")[1] == thang_loc_nam)))
                     if not available_months:
                         available_months = [f"{i:02d}" for i in range(1, 13)]
